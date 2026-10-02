@@ -1,0 +1,16 @@
+[package]
+name = "studyshield"
+version = "1.0.0"
+description = "Private, adaptive revision powered by local AI"
+authors = ["StudyShield contributors"]
+edition = "2021"
+
+[lib]
+name = "studyshield_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }

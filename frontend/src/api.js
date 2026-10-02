@@ -8,7 +8,14 @@ async function request(path, options = {}) {
     throw new Error('StudyShield could not reach the local backend. Is FastAPI running?')
   }
   const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw new Error(data.detail || 'The request could not be completed.')
+  if (!response.ok) {
+    const detail = data.detail || ''
+    if (/ollama.*(unavailable|connect|running)/i.test(detail)) throw new Error('Ollama is not running. Start Ollama, then try again.')
+    if (/model.*(not found|missing)/i.test(detail)) throw new Error('Qwen3 14B is not installed. Run: ollama pull qwen3:14b')
+    if (/readable text/i.test(detail)) throw new Error("This PDF doesn't contain readable text. Try a text-based PDF.")
+    if (/timed out|timeout/i.test(detail)) throw new Error('The local model took too long to respond. Try again with a shorter PDF.')
+    throw new Error(detail || 'The request could not be completed.')
+  }
   return data
 }
 
@@ -20,15 +27,20 @@ function withFile(file, fields = {}) {
 }
 
 export const api = {
+  health: () => request('/health'),
   analyze: (file) => request('/analyze-pdf', { method: 'POST', body: withFile(file) }),
   quiz: (file) => request('/generate-quiz', { method: 'POST', body: withFile(file) }),
   adaptiveQuiz: (file, studentId, topic) => request('/adaptive-question', {
     method: 'POST', body: withFile(file, { student_id: studentId, topic }),
   }),
+  conceptGraph: (file, studentId) => request('/concept-graph', {
+    method: 'POST', body: withFile(file, { student_id: studentId }),
+  }),
   evaluate: (payload) => request('/evaluate-answer', {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
   }),
   progress: (studentId) => request(`/progress/${encodeURIComponent(studentId)}`),
+  misconceptions: (studentId) => request(`/misconceptions/${encodeURIComponent(studentId)}`),
   fixWeakAreas: (studentId) => request('/fix-weak-areas', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ student_id: studentId }),
