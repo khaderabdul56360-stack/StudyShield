@@ -1,4 +1,4 @@
-import { ArrowRight, Database, FileText, GitFork, Network, RefreshCw, Target, Upload } from 'lucide-react'
+import { ArrowRight, Crosshair, Database, FileText, GitFork, Network, RefreshCw, Target, Upload } from 'lucide-react'
 import GraphCanvas from '../components/GraphCanvas'
 import { Badge, Empty, Meter, PickFile, ScoreRing, SectionHead, Skeleton } from '../components/ui'
 import { STATUS_LABEL } from '../lib/metrics'
@@ -15,7 +15,7 @@ function Legend() {
   </div>
 }
 
-function Detail({ concept, graph, onSelect, onPractice, busy }) {
+function Detail({ concept, graph, onSelect, onPractice, onFocus, busy }) {
   const byId = Object.fromEntries(graph.concepts.map(c => [c.id, c]))
   const linked = graph.edges.filter(e => e.source === concept.id || e.target === concept.id)
   // An edge "A -prerequisite-> B" means A must be understood before B.
@@ -40,12 +40,15 @@ function Detail({ concept, graph, onSelect, onPractice, busy }) {
       const other = byId[edge.source === concept.id ? edge.target : edge.source]
       return other && <li key={`${other.id}-${i}`}><span>{REL_LABEL[edge.relationship]}</span><button onClick={() => onSelect(other)}>{other.label}<ArrowRight aria-hidden="true"/></button></li>
     })}</ul> : <p className="muted">No other links in this graph.</p>}
-    <button className="button primary shine full" onClick={() => onPractice(concept.label)} disabled={busy}><Target aria-hidden="true"/>Practice This</button>
+    <div className="detail-actions">
+      <button className="button primary shine full" onClick={() => onPractice(concept.label)} disabled={busy}><Target aria-hidden="true"/>Practice This</button>
+      <button className="button secondary full" onClick={() => onFocus(concept.label)} disabled={busy}><Crosshair aria-hidden="true"/>Focus on this topic</button>
+    </div>
   </aside>
 }
 
 export default function ConceptGraph({ ctx }) {
-  const { file, conceptGraph, selectedConcept, setSelectedConcept, buildConceptGraph, practiceTopic, onPickFile, task } = ctx
+  const { file, conceptGraph, selectedConcept, setSelectedConcept, buildConceptGraph, practiceTopic, startFocus, onPickFile, task } = ctx
   const busy = Boolean(task)
   const building = task?.kind === 'graph'
   return <section className="screen">
@@ -81,7 +84,7 @@ export default function ConceptGraph({ ctx }) {
             })}</ul>
           </details>
         </article>
-        {selectedConcept ? <Detail concept={selectedConcept} graph={conceptGraph} onSelect={setSelectedConcept} onPractice={practiceTopic} busy={busy}/>
+        {selectedConcept ? <Detail concept={selectedConcept} graph={conceptGraph} onSelect={setSelectedConcept} onPractice={practiceTopic} onFocus={startFocus} busy={busy}/>
           : <aside className="card"><Empty icon={Target} title="Choose a concept" copy="Select a node to inspect its progress and connections."/></aside>}
       </div>
     </>}

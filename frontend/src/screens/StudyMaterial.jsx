@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import {
   AlertTriangle, ArrowRight, Check, CheckCircle2, FileText, GitFork, Layers, ScanText, ShieldCheck,
-  Sparkles, Target, Upload, Zap,
+  Sparkles, Target, Trash2, Upload, Zap,
 } from 'lucide-react'
 import { Badge, Empty, PickFile, SectionHead, Skeleton } from '../components/ui'
 import { formatBytes } from '../lib/metrics'
@@ -23,7 +23,7 @@ function DropZone({ onPickFile }) {
 }
 
 export default function StudyMaterial({ ctx }) {
-  const { file, analysis, task, onPickFile, analyze, startQuiz, testMe, buildConceptGraph, go } = ctx
+  const { file, analysis, task, onPickFile, analyze, startQuiz, testMe, buildConceptGraph, go, restoredMaterial, forgetStudyMaterial } = ctx
   const analyzing = task?.kind === 'analyze'
   const status = analyzing ? 'Analyzing' : analysis ? 'Analyzed' : 'Ready'
   const busy = Boolean(task)
@@ -31,7 +31,10 @@ export default function StudyMaterial({ ctx }) {
   return <section className="screen">
     <SectionHead eyebrow="Study material" title="Turn pages into a study map."
       copy="Load a PDF and Qwen3 14B maps its topics, key ideas and tricky areas — on this device."
-      actions={file && <PickFile onPick={onPickFile}><Upload aria-hidden="true"/>Change PDF</PickFile>}/>
+      actions={file && <>
+        <PickFile onPick={onPickFile}><Upload aria-hidden="true"/>Change PDF</PickFile>
+        <button className="button ghost" onClick={forgetStudyMaterial} disabled={busy} title="Remove this PDF from the app's storage on this device"><Trash2 aria-hidden="true"/>Forget</button>
+      </>}/>
 
     {!file ? <div className="card upload-card"><DropZone onPickFile={onPickFile}/>
       <ul className="upload-steps" aria-label="What happens next">
@@ -49,7 +52,7 @@ export default function StudyMaterial({ ctx }) {
         <Badge tone={analyzing ? 'violet' : analysis ? 'success' : 'cyan'} icon={analysis && !analyzing ? CheckCircle2 : undefined}>
           {analyzing && <span className="live-dot" aria-hidden="true"/>}{status}
         </Badge>
-        <Badge tone="neutral" icon={ShieldCheck} className="hide-sm">Stays on device</Badge>
+        <Badge tone="neutral" icon={ShieldCheck} className="hide-sm">{restoredMaterial ? 'Resumed from this device' : 'Stays on device'}</Badge>
       </div>
 
       <div className="quick-actions" role="group" aria-label="Quick actions">

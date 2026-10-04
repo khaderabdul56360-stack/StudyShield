@@ -19,7 +19,7 @@ export default function Misconceptions({ ctx }) {
 
   return <section className="screen">
     <SectionHead eyebrow="Misconception memory" title="Turn wrong ideas into durable learning."
-      copy="Specific misunderstandings found in your answers. Each resolves once you answer that topic strongly later."
+      copy="Specific misunderstandings found in your answers. Each resolves when a later strong answer shows the corrected idea."
       actions={<button className="button secondary" onClick={refreshLearning} disabled={busy}><RefreshCw aria-hidden="true"/>Refresh</button>}/>
 
     {task?.kind === 'learning' && !learningLoaded ? <div className="myth-grid"><Skeleton/><Skeleton/></div>

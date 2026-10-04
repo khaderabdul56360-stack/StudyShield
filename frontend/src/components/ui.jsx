@@ -88,7 +88,7 @@ export function Thinking({ task }) {
     <div className="thinking-orb" aria-hidden="true"><BrainCircuit/></div>
     <div className="thinking-copy">
       <strong>{task.label}</strong>
-      <span>Thinking locally with Qwen3 14B · {elapsed}s</span>
+      <span>Thinking locally with Qwen3 14B · {elapsed}s{task.previous ? ` · last time ${task.previous}s` : ''}</span>
       {task.steps && <ol className="thinking-steps">{task.steps.map(step => <li key={step}>{step}</li>)}</ol>}
     </div>
     <div className="thinking-bar" aria-hidden="true"><span/></div>

@@ -21,17 +21,33 @@ async function request(path, options = {}) {
 
 function withFile(file, fields = {}) {
   const body = new FormData()
-  body.append('file', file)
+  if (file) body.append('file', file)
   Object.entries(fields).forEach(([key, value]) => value && body.append(key, value))
   return body
 }
 
 export const api = {
   health: () => request('/health'),
+  modelStatus: () => request('/model-status'),
   analyze: (file) => request('/analyze-pdf', { method: 'POST', body: withFile(file) }),
   quiz: (file) => request('/generate-quiz', { method: 'POST', body: withFile(file) }),
-  adaptiveQuiz: (file, studentId, topic) => request('/adaptive-question', {
-    method: 'POST', body: withFile(file, { student_id: studentId, topic }),
+  // options: { topic, focus, scope: 'adaptive' | 'weak' | 'all', avoid: [topics already asked] }
+  adaptiveQuiz: (file, studentId, { topic, focus = false, scope, avoid } = {}) => request('/adaptive-question', {
+    method: 'POST',
+    body: withFile(file, {
+      student_id: studentId, topic, focus: focus ? 'true' : '', scope, avoid: avoid?.length ? JSON.stringify(avoid) : '',
+    }),
+  }),
+  explain: (payload) => request('/explain', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+  }),
+  // Deterministic: no model call. The PDF (optional) only lets the API add unpractised graph concepts.
+  revisionQueue: (studentId, file) => request('/revision-queue', {
+    method: 'POST', body: withFile(file, { student_id: studentId }),
+  }),
+  sessionSummary: (studentId, attemptIds) => request('/session-summary', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ student_id: studentId, attempt_ids: attemptIds }),
   }),
   conceptGraph: (file, studentId) => request('/concept-graph', {
     method: 'POST', body: withFile(file, { student_id: studentId }),

@@ -1,5 +1,5 @@
 import {
-  AlertTriangle, ArrowRight, CheckCircle2, Flag, Lightbulb, MessageCircleQuestion, RefreshCw, Sparkles,
+  AlertTriangle, ArrowRight, CheckCircle2, Crosshair, Flag, Lightbulb, MessageCircleQuestion, RefreshCw, Sparkles,
   Target, Zap,
 } from 'lucide-react'
 import { Badge, Empty, Meter, SectionHead, Skeleton } from '../components/ui'
@@ -33,7 +33,7 @@ function Roadmap({ plan, onPractice, busy }) {
 }
 
 export default function WeakAreas({ ctx }) {
-  const { summary, misconceptions, weakPlan, fixWeakAreas, practiceTopic, refreshLearning, task, go, file, learningLoaded } = ctx
+  const { summary, misconceptions, weakPlan, fixWeakAreas, practiceTopic, startFocus, refreshLearning, task, go, file, learningLoaded } = ctx
   const busy = Boolean(task)
   const planning = task?.kind === 'plan'
   const activeByTopic = {}
@@ -68,7 +68,12 @@ export default function WeakAreas({ ctx }) {
             <div className="weak-score"><b className={`tone-text-${tone}`}>{item.average_score}%</b><Meter value={item.average_score} tone={tone} label={`${item.topic} score`}/></div>
             <p className="muted">{item.high_confidence_wrong ? 'A high-confidence incorrect answer needs immediate correction.' : 'The current average is below the 85% mastery threshold.'}</p>
             {linked > 0 && <button className="link-chip" onClick={() => go('Misconceptions')}><AlertTriangle aria-hidden="true"/>{linked} active misconception{linked > 1 ? 's' : ''}<ArrowRight aria-hidden="true"/></button>}
-            <div className="next-step"><span>Next step</span><button className="text-link" onClick={() => practiceTopic(item.topic)} disabled={busy}>Practice this topic<ArrowRight aria-hidden="true"/></button></div>
+            <div className="next-step"><span>Next step</span>
+              <div className="next-step-actions">
+                <button className="text-link" onClick={() => practiceTopic(item.topic)} disabled={busy}>Practice<ArrowRight aria-hidden="true"/></button>
+                <button className="text-link" onClick={() => startFocus(item.topic)} disabled={busy} aria-label={`Start a focus session on ${item.topic}`}><Crosshair aria-hidden="true"/>Focus session</button>
+              </div>
+            </div>
           </article>
         })}</div> : <div className="card"><Empty icon={CheckCircle2} tone="success" title="No weak topics" copy="Every topic you've practised is at 85% or above. Keep testing to stay sharp."/></div>}
 

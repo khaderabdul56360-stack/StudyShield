@@ -2,6 +2,7 @@ import {
   AlertTriangle, BarChart3, CalendarClock, Gauge, RefreshCw, Target, Trophy, Upload, Zap,
 } from 'lucide-react'
 import { Badge, Empty, Meter, PickFile, SectionHead, Skeleton, Stat } from '../components/ui'
+import RevisionQueue from '../components/RevisionQueue'
 import { confidenceLabel, formatDate, relativeTime, statusFor } from '../lib/metrics'
 
 const TONE = { strong: 'success', needs_revision: 'warning', weak: 'danger', unpracticed: 'neutral' }
@@ -27,7 +28,7 @@ function Calibration({ calibration }) {
 }
 
 export default function Progress({ ctx }) {
-  const { summary, refreshLearning, task, go, file, onPickFile, learningLoaded } = ctx
+  const { summary, refreshLearning, task, go, file, onPickFile, learningLoaded, queue, practiceTopic, startFocus } = ctx
   const busy = Boolean(task)
   const loading = task?.kind === 'learning' && !learningLoaded
 
@@ -50,6 +51,8 @@ export default function Progress({ ctx }) {
           <Stat label="Active misconceptions" icon={AlertTriangle} tone="danger" value={summary.activeMisconceptions ?? 0} hint="Unresolved mistakes"/>
           <Stat label="Reviews due" icon={CalendarClock} tone="neutral" value={summary.reviewsDue} hint="Topics below mastery"/>
         </div>
+
+        <RevisionQueue items={queue} limit={5} onPractice={practiceTopic} onFocus={startFocus} busy={busy}/>
 
         <div className="progress-grid">
           <article className="card span-2">

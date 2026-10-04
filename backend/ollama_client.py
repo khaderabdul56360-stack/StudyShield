@@ -46,3 +46,25 @@ def ask_model(prompt: str, json_mode: bool = False) -> str:
         return data["response"]
     except (ValueError, KeyError, TypeError) as exc:
         raise OllamaModelError("Ollama returned an unexpected response.") from exc
+
+
+def _ollama_base() -> str:
+    return OLLAMA_URL.split("/api/")[0]
+
+
+def model_status() -> dict:
+    """Read-only local check against Ollama's own API; never triggers inference."""
+    try:
+        response = requests.get(f"{_ollama_base()}/api/tags", timeout=3)
+        response.raise_for_status()
+        names = {item.get("name") for item in response.json().get("models", [])}
+    except (requests.RequestException, ValueError, AttributeError):
+        return {"ollama": False, "installed": False, "loaded": False}
+    installed = MODEL in names or f"{MODEL}:latest" in names
+    try:
+        running = requests.get(f"{_ollama_base()}/api/ps", timeout=3)
+        running.raise_for_status()
+        loaded = any(item.get("name") in (MODEL, f"{MODEL}:latest") for item in running.json().get("models", []))
+    except (requests.RequestException, ValueError, AttributeError):
+        loaded = False
+    return {"ollama": True, "installed": installed, "loaded": loaded}

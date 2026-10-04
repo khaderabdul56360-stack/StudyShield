@@ -1,6 +1,24 @@
+import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
+
+MAX_CONCEPTS = 16
+MAX_EDGES = 32
+RELATIONSHIPS = ("prerequisite", "related", "supports", "part_of")
+
+
+def _canonical(value, options):
+    """Accept a model's casing/spacing variants of a fixed label ("needs revision"); keep nonsense invalid."""
+    def key(text):
+        return " ".join(text.replace("_", " ").split()).casefold()
+    if isinstance(value, str):
+        return next((option for option in options if key(option) == key(value)), value)
+    return value
+
+
+def _slug(value) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value).casefold()).strip("-")[:80]
 
 
 class TopicAnalysis(BaseModel):
@@ -27,6 +45,11 @@ class Quiz(BaseModel):
     expected_answer: str = Field(min_length=1)
     explanation: str = Field(min_length=1)
 
+    @field_validator("difficulty", mode="before")
+    @classmethod
+    def canonical_difficulty(cls, value):
+        return _canonical(value, ("Easy", "Medium", "Hard"))
+
 
 class Evaluation(BaseModel):
     score: int = Field(ge=0, le=100)
@@ -36,6 +59,15 @@ class Evaluation(BaseModel):
     feedback: str = Field(min_length=1)
     misconceptions: list[str] = Field(default_factory=list, max_length=4)
     resolved_misconceptions: list[str] = Field(default_factory=list, max_length=4)
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def canonical_status(cls, value):
+        return _canonical(value, ("Strong", "Needs Revision", "Weak"))
+
+
+class Explanation(BaseModel):
+    explanation: str = Field(min_length=1, max_length=6_000)
 
 
 class WeakTopic(BaseModel):
@@ -67,8 +99,55 @@ class ConceptEdge(BaseModel):
 
 
 class ConceptGraph(BaseModel):
-    concepts: list[ConceptNode] = Field(min_length=1, max_length=16)
-    edges: list[ConceptEdge] = Field(default_factory=list, max_length=32)
+    concepts: list[ConceptNode] = Field(min_length=1, max_length=MAX_CONCEPTS)
+    edges: list[ConceptEdge] = Field(default_factory=list, max_length=MAX_EDGES)
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_model_output(cls, data):
+        """Repair harmless model slips (ID casing, dangling or duplicate edges, too many nodes) instead of
+        failing the whole graph. Concepts without a label still fail validation."""
+        if not isinstance(data, dict) or not isinstance(data.get("concepts"), list):
+            return data
+        concepts, ids, seen = [], {}, set()
+        for concept in data["concepts"]:
+            if not isinstance(concept, dict):
+                concepts.append(concept)
+                continue
+            original = concept.get("id") or concept.get("label") or ""
+            slug = _slug(original)
+            if not slug or slug in seen:
+                continue
+            seen.add(slug)
+            ids[str(original)] = ids[slug] = slug
+            if concept.get("label"):
+                ids[str(concept["label"])] = ids[_slug(concept["label"])] = slug
+            importance = concept.get("importance", 0.5)
+            try:
+                importance = min(1.0, max(0.0, float(importance)))
+            except (TypeError, ValueError):
+                pass
+            concepts.append({**concept, "id": slug, "importance": importance})
+        def weight(concept):
+            value = concept.get("importance") if isinstance(concept, dict) else None
+            return -value if isinstance(value, float) else 0
+        concepts = sorted(concepts, key=weight)[:MAX_CONCEPTS]
+        kept = {c["id"] for c in concepts if isinstance(c, dict)}
+
+        edges, pairs = [], set()
+        for edge in data.get("edges") or []:
+            if not isinstance(edge, dict):
+                continue
+            source = ids.get(str(edge.get("source")), _slug(edge.get("source", "")))
+            target = ids.get(str(edge.get("target")), _slug(edge.get("target", "")))
+            relationship = _canonical(str(edge.get("relationship", "related")), RELATIONSHIPS)
+            if relationship not in RELATIONSHIPS:
+                relationship = "related"
+            if source not in kept or target not in kept or source == target or (source, target) in pairs:
+                continue
+            pairs.add((source, target))
+            edges.append({"source": source, "target": target, "relationship": relationship})
+        return {**data, "concepts": concepts, "edges": edges[:MAX_EDGES]}
 
     @model_validator(mode="after")
     def validate_graph(self):

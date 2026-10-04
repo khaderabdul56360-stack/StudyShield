@@ -43,6 +43,8 @@ class ProgressRepository:
                     feedback TEXT NOT NULL,
                     confidence TEXT NOT NULL DEFAULT 'medium' CHECK(confidence IN ('low', 'medium', 'high')),
                     confidence_insight TEXT NOT NULL DEFAULT '',
+                    difficulty TEXT NOT NULL DEFAULT 'Medium',
+                    request_id TEXT,
                     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                 )
                 """
@@ -52,6 +54,15 @@ class ProgressRepository:
                 connection.execute("ALTER TABLE attempts ADD COLUMN confidence TEXT NOT NULL DEFAULT 'medium'")
             if "confidence_insight" not in columns:
                 connection.execute("ALTER TABLE attempts ADD COLUMN confidence_insight TEXT NOT NULL DEFAULT ''")
+            if "difficulty" not in columns:
+                connection.execute("ALTER TABLE attempts ADD COLUMN difficulty TEXT NOT NULL DEFAULT 'Medium'")
+            if "request_id" not in columns:
+                connection.execute("ALTER TABLE attempts ADD COLUMN request_id TEXT")
+            # A retried submission carries the same request_id, so it can never create a second attempt.
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_attempts_request "
+                "ON attempts(student_id, request_id) WHERE request_id IS NOT NULL"
+            )
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS misconceptions (
@@ -90,19 +101,21 @@ class ProgressRepository:
                     expected_answer: str, student_answer: str, score: int,
                     status: str, correct_points: list[str],
                     missing_points: list[str], feedback: str, confidence: str = "medium",
-                    confidence_insight: str = "") -> dict:
+                    confidence_insight: str = "", difficulty: str = "Medium",
+                    request_id: str | None = None) -> dict:
         with self.connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT INTO attempts (
                     student_id, topic, question, expected_answer, student_answer,
                     score, status, correct_points, missing_points, feedback,
-                    confidence, confidence_insight
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    confidence, confidence_insight, difficulty, request_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (student_id, topic, question, expected_answer, student_answer,
                  score, status, json.dumps(correct_points),
-                 json.dumps(missing_points), feedback, confidence, confidence_insight),
+                 json.dumps(missing_points), feedback, confidence, confidence_insight,
+                 difficulty, request_id),
             )
             row = connection.execute(
                 "SELECT * FROM attempts WHERE id = ?", (cursor.lastrowid,)
@@ -115,6 +128,36 @@ class ProgressRepository:
                 "SELECT * FROM attempts WHERE student_id = ? ORDER BY id", (student_id,)
             ).fetchall()
         return [self._deserialize(row) for row in rows]
+
+    def attempt_by_request(self, student_id: str, request_id: str) -> dict | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM attempts WHERE student_id = ? AND request_id = ?", (student_id, request_id)
+            ).fetchone()
+        return self._deserialize(row) if row else None
+
+    def attempts_by_ids(self, student_id: str, attempt_ids: list[int]) -> list[dict]:
+        placeholders = ",".join("?" for _ in attempt_ids)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"SELECT * FROM attempts WHERE student_id = ? AND id IN ({placeholders}) ORDER BY id",
+                (student_id, *attempt_ids),
+            ).fetchall()
+        return [self._deserialize(row) for row in rows]
+
+    def misconceptions_for_attempts(self, student_id: str, attempt_ids: list[int]) -> list[dict]:
+        """Misconceptions whose latest evidence came from one of these attempts."""
+        placeholders = ",".join("?" for _ in attempt_ids)
+        with self.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT * FROM misconceptions
+                WHERE student_id = ? AND last_attempt_id IN ({placeholders})
+                ORDER BY id
+                """,
+                (student_id, *attempt_ids),
+            ).fetchall()
+        return [self._misconception_row(row) for row in rows]
 
     def topic_statistics(self, student_id: str) -> list[dict]:
         with self.connect() as connection:

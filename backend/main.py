@@ -1,6 +1,7 @@
 import json
 import hashlib
 import os
+import re
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -8,27 +9,40 @@ from typing import Literal
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from pypdf.errors import PdfReadError
 
 try:
-    from .adaptive import choose_next_target, confidence_insight, priority_for_score, status_for_score
+    from .adaptive import (choose_next_target, confidence_insight, priority_for_score, revision_queue,
+                           status_for_score, summarize_session)
     from .database import ProgressRepository
     from .model_utils import StructuredOutputError, ask_structured
-    from .ollama_client import MODEL, OllamaModelError, OllamaTimeoutError, OllamaUnavailableError, ask_model
+    from .ollama_client import (MODEL, OllamaModelError, OllamaTimeoutError, OllamaUnavailableError, ask_model,
+                                model_status)
     from .pdf_utils import MAX_PDF_BYTES, chunk_text, extract_text_from_bytes
-    from .schemas import ConceptGraph, Evaluation, PDFAnalysis, Quiz
+    from .schemas import ConceptGraph, Evaluation, Explanation, PDFAnalysis, Quiz
 except ImportError:
-    from adaptive import choose_next_target, confidence_insight, priority_for_score, status_for_score
+    from adaptive import (choose_next_target, confidence_insight, priority_for_score, revision_queue,
+                          status_for_score, summarize_session)
     from database import ProgressRepository
     from model_utils import StructuredOutputError, ask_structured
-    from ollama_client import MODEL, OllamaModelError, OllamaTimeoutError, OllamaUnavailableError, ask_model
+    from ollama_client import (MODEL, OllamaModelError, OllamaTimeoutError, OllamaUnavailableError, ask_model,
+                               model_status)
     from pdf_utils import MAX_PDF_BYTES, chunk_text, extract_text_from_bytes
-    from schemas import ConceptGraph, Evaluation, PDFAnalysis, Quiz
+    from schemas import ConceptGraph, Evaluation, Explanation, PDFAnalysis, Quiz
 
 
 repository = ProgressRepository()
 MAX_ANALYSIS_CHUNKS = 12
+MAX_SESSION_QUESTIONS = 20
+EXPLANATION_STYLES = {
+    "simpler": "Explain it in simple, everyday language a younger student would follow. Short sentences.",
+    "steps": "Explain it as 3 to 6 numbered steps, one idea per step, each on its own line.",
+    "example": "Teach it through one concrete, worked example taken from or consistent with the material.",
+    "analogy": ("Explain it with one intuitive analogy, then state plainly where the analogy stops "
+                "matching the real science. Never sacrifice factual accuracy for the analogy."),
+}
 
 
 @asynccontextmanager
@@ -69,6 +83,22 @@ class AnswerEvaluationRequest(BaseModel):
     expected_answer: str = Field(min_length=1, max_length=20_000)
     student_answer: str = Field(min_length=1, max_length=20_000)
     confidence: Literal["low", "medium", "high"] = "medium"
+    difficulty: Literal["Easy", "Medium", "Hard"] = "Medium"
+    # Client-generated per question; a retried submission with the same ID returns the saved attempt.
+    request_id: str | None = Field(default=None, min_length=8, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+class ExplainRequest(BaseModel):
+    topic: str = Field(min_length=1, max_length=200)
+    question: str = Field(min_length=1, max_length=10_000)
+    expected_answer: str = Field(min_length=1, max_length=20_000)
+    student_answer: str = Field(min_length=1, max_length=20_000)
+    style: Literal["simpler", "steps", "example", "analogy"]
+
+
+class SessionSummaryRequest(BaseModel):
+    student_id: str = Field(min_length=1, max_length=100)
+    attempt_ids: list[int] = Field(min_length=1, max_length=MAX_SESSION_QUESTIONS)
 
 
 class WeakAreaRequest(BaseModel):
@@ -155,10 +185,22 @@ STUDY MATERIAL:
 {material}'''
 
 
+FILLER_WORDS = {"the", "a", "an", "and", "of", "in", "to", "for", "on", "its"}
+
+
+def _words(text: str) -> set[str]:
+    return {word for word in re.findall(r"[a-z0-9]+", text.casefold()) if word not in FILLER_WORDS}
+
+
+def _same_topic(concept: str, topic: str) -> bool:
+    # Whole-word containment: "Calvin Cycle" matches "The Calvin cycle", but "Oxygen" never matches
+    # "Deoxygenation" and "Ion" never matches "Respiration" (plain substring matching did).
+    concept_words, topic_words = _words(concept), _words(topic)
+    return bool(concept_words and topic_words) and (concept_words <= topic_words or topic_words <= concept_words)
+
+
 def _concept_performance(label: str, statistics: list[dict]) -> dict:
-    normalized = label.casefold()
-    matches = [item for item in statistics if normalized in item["topic"].casefold()
-               or item["topic"].casefold() in normalized]
+    matches = [item for item in statistics if _same_topic(label, item["topic"])]
     if not matches:
         return {"average_score": None, "attempts": 0, "status": "unpracticed"}
     attempts = sum(item["attempts"] for item in matches)
@@ -178,8 +220,13 @@ def _specific_misconceptions(items: list[str]) -> list[str]:
     return result[:4]
 
 
-def _quiz_prompt(material: str, topic: str | None = None, difficulty: str | None = None) -> str:
+def _quiz_prompt(material: str, topic: str | None = None, difficulty: str | None = None,
+                 related: list[str] | None = None, avoid: list[str] | None = None) -> str:
     targeting = f"Test the topic '{topic}' at {difficulty or 'Medium'} difficulty." if topic else ""
+    if topic and related:
+        targeting += f" You may connect it to its prerequisite concepts: {', '.join(related)}."
+    if not topic and avoid:
+        targeting += f" Cover a different part of the material than: {', '.join(avoid)}."
     return f'''You are StudyShield, an adaptive local study coach. Using only the supplied
 material, create one understanding-based, non-yes/no revision question. {targeting}
 Return ONLY valid JSON:
@@ -198,6 +245,40 @@ def _quiz_material(text: str, topic: str | None = None) -> str:
         if matching:
             return matching
     return chunks[0]
+
+
+def _unpracticed_concepts(graph: dict | None, statistics: list[dict]) -> list[dict]:
+    if not graph:
+        return []
+    return [{"label": concept["label"], "importance": concept["importance"]}
+            for concept in graph.get("concepts", [])
+            if _concept_performance(concept["label"], statistics)["attempts"] == 0]
+
+
+def _prerequisites(graph: dict | None, topic: str) -> list[str]:
+    if not graph:
+        return []
+    by_id = {concept["id"]: concept["label"] for concept in graph.get("concepts", [])}
+    target = next((concept["id"] for concept in graph.get("concepts", [])
+                   if concept["label"].casefold() == topic.casefold()), None)
+    return [by_id[edge["source"]] for edge in graph.get("edges", [])
+            if edge["target"] == target and edge["relationship"] == "prerequisite" and edge["source"] in by_id][:3]
+
+
+def _parse_avoid(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=422, detail="avoid must be a JSON list of topics.") from exc
+    if not isinstance(values, list) or not all(isinstance(value, str) for value in values):
+        raise HTTPException(status_code=422, detail="avoid must be a JSON list of topics.")
+    return [value.strip()[:200] for value in values if value.strip()][:MAX_SESSION_QUESTIONS]
+
+
+def _material_hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _graph_material(text: str, max_chunks: int = 3) -> str:
@@ -234,6 +315,12 @@ def health():
     return {"status": "ok", "service": "StudyShield API", "version": "1.0.0"}
 
 
+@app.get("/model-status")
+def get_model_status():
+    """Startup readiness: is local Ollama up, is the model installed, is it already loaded (warm)?"""
+    return {"model": MODEL, **model_status()}
+
+
 @app.post("/ai")
 def ai(request: PromptRequest):
     return {"response": _model_call(request.prompt)}
@@ -248,7 +335,8 @@ async def upload_pdf(file: UploadFile = File(...)):
 @app.post("/analyze-pdf")
 async def analyze_pdf(file: UploadFile = File(...)):
     filename, text = await _read_pdf(file)
-    analysis = _analyze_chunks(text)
+    # Model calls block, so keep them off the event loop; /health must stay responsive meanwhile.
+    analysis = await run_in_threadpool(_analyze_chunks, text)
     return {"filename": filename, "characters_extracted": len(text), "model": MODEL,
             "analysis": analysis.model_dump()}
 
@@ -256,14 +344,14 @@ async def analyze_pdf(file: UploadFile = File(...)):
 @app.post("/generate-quiz")
 async def generate_quiz(file: UploadFile = File(...)):
     filename, text = await _read_pdf(file)
-    quiz = _structured(_quiz_prompt(_quiz_material(text)), Quiz)
+    quiz = await run_in_threadpool(_structured, _quiz_prompt(_quiz_material(text)), Quiz)
     return {"filename": filename, "model": MODEL, "quiz": quiz.model_dump()}
 
 
 @app.post("/concept-graph")
 async def concept_graph(student_id: str = Form(...), file: UploadFile = File(...)):
     filename, text = await _read_pdf(file)
-    material_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    material_hash = _material_hash(text)
     try:
         cached_graph = repository.get_concept_graph(material_hash)
         statistics = repository.topic_statistics(student_id)
@@ -272,7 +360,7 @@ async def concept_graph(student_id: str = Form(...), file: UploadFile = File(...
 
     cached = cached_graph is not None
     if cached_graph is None:
-        graph = _structured(_concept_graph_prompt(_graph_material(text)), ConceptGraph)
+        graph = await run_in_threadpool(_structured, _concept_graph_prompt(_graph_material(text)), ConceptGraph)
         cached_graph = graph.model_dump()
         try:
             repository.save_concept_graph(material_hash, cached_graph)
@@ -293,10 +381,34 @@ async def concept_graph(student_id: str = Form(...), file: UploadFile = File(...
             "edges": [edge.model_dump() for edge in graph.edges]}
 
 
+def _evaluation_response(request: AnswerEvaluationRequest, attempt: dict, evaluation: dict,
+                         recorded: list[dict], duplicate: bool = False) -> dict:
+    return {"model": MODEL, "student_id": request.student_id, "topic": request.topic,
+            "evaluation": {**evaluation, "confidence": attempt["confidence"],
+                           "confidence_insight": attempt["confidence_insight"]},
+            "attempt_id": attempt["id"], "misconceptions_recorded": recorded, "duplicate": duplicate}
+
+
+def _replay_attempt(request: AnswerEvaluationRequest, attempt: dict) -> dict:
+    evaluation = {key: attempt[key] for key in ("score", "status", "correct_points", "missing_points", "feedback")}
+    recorded = repository.misconceptions_for_attempts(request.student_id, [attempt["id"]])
+    return _evaluation_response(request, attempt, {**evaluation, "misconceptions": [],
+                                                   "resolved_misconceptions": []}, recorded, duplicate=True)
+
+
 @app.post("/evaluate-answer")
 def evaluate_answer(request: AnswerEvaluationRequest):
+    if request.request_id:
+        try:
+            existing = repository.attempt_by_request(request.student_id, request.request_id)
+        except sqlite3.Error as exc:
+            raise HTTPException(status_code=500, detail="Progress could not be loaded.") from exc
+        if existing:
+            return _replay_attempt(request, existing)
     prompt = f'''Evaluate the student answer semantically against the expected answer.
-Give fair partial credit and ignore minor grammar mistakes. Return ONLY valid JSON:
+Give fair partial credit for correct ideas and ignore minor grammar mistakes. Award no credit
+for factually wrong statements; if the answer contradicts the expected answer's core idea or
+covers almost none of it, the score must be below 60. Return ONLY valid JSON:
 {{"score":75,"status":"Needs Revision","correct_points":["..."],
 "missing_points":["..."],"feedback":"...",
 "misconceptions":["Student specifically confuses X with Y"],
@@ -312,11 +424,18 @@ STUDENT ANSWER: {request.student_answer}'''
     evaluation.status = status_for_score(evaluation.score)
     insight = confidence_insight(request.confidence, evaluation.score, evaluation.status)
     try:
-        attempt = repository.add_attempt(
-            **request.model_dump(), score=evaluation.score, status=evaluation.status,
-            correct_points=evaluation.correct_points, missing_points=evaluation.missing_points,
-            feedback=evaluation.feedback, confidence_insight=insight,
-        )
+        try:
+            attempt = repository.add_attempt(
+                **request.model_dump(), score=evaluation.score, status=evaluation.status,
+                correct_points=evaluation.correct_points, missing_points=evaluation.missing_points,
+                feedback=evaluation.feedback, confidence_insight=insight,
+            )
+        except sqlite3.IntegrityError:
+            # A concurrent retry with the same request_id won the insert; return that attempt.
+            existing = repository.attempt_by_request(request.student_id, request.request_id or "")
+            if existing is None:
+                raise
+            return _replay_attempt(request, existing)
         recorded = []
         if evaluation.score < 85:
             for misconception in _specific_misconceptions(evaluation.misconceptions):
@@ -336,10 +455,51 @@ STUDENT ANSWER: {request.student_answer}'''
                     repository.resolve_misconception(request.student_id, item["id"])
     except sqlite3.Error as exc:
         raise HTTPException(status_code=500, detail="Progress could not be saved.") from exc
-    return {"model": MODEL, "student_id": request.student_id, "topic": request.topic,
-            "evaluation": {**evaluation.model_dump(), "confidence": request.confidence,
-                           "confidence_insight": insight}, "attempt_id": attempt["id"],
-            "misconceptions_recorded": recorded}
+    return _evaluation_response(request, attempt, evaluation.model_dump(), recorded)
+
+
+@app.post("/explain")
+def explain(request: ExplainRequest):
+    prompt = f'''You are StudyShield, a private local study coach. A student answered a revision
+question. Explain the correct idea to them. {EXPLANATION_STYLES[request.style]}
+Stay faithful to the expected answer; do not add facts it does not support. Address the
+student's answer directly where it went wrong. Keep it under 180 words.
+Return ONLY valid JSON: {{"explanation":"..."}}
+TOPIC: {request.topic}
+QUESTION: {request.question}
+EXPECTED ANSWER: {request.expected_answer}
+STUDENT ANSWER: {request.student_answer}'''
+    result = _structured(prompt, Explanation)
+    return {"model": MODEL, "style": request.style, "explanation": result.explanation}
+
+
+@app.post("/revision-queue")
+async def get_revision_queue(student_id: str = Form(...), file: UploadFile | None = File(default=None)):
+    text = None
+    if file is not None:
+        _, text = await _read_pdf(file)
+    try:
+        history = repository.history(student_id)
+        misconceptions = repository.misconceptions(student_id)
+        statistics = repository.topic_statistics(student_id)
+        graph = repository.get_concept_graph(_material_hash(text)) if text else None
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=500, detail="The revision queue could not be loaded.") from exc
+    queue = revision_queue(history, misconceptions, _unpracticed_concepts(graph, statistics))
+    return {"student_id": student_id, "uses_concept_graph": graph is not None, "queue": queue[:8]}
+
+
+@app.post("/session-summary")
+def session_summary(request: SessionSummaryRequest):
+    ids = sorted(set(request.attempt_ids))
+    try:
+        attempts = repository.attempts_by_ids(request.student_id, ids)
+        misconceptions = repository.misconceptions_for_attempts(request.student_id, ids)
+    except sqlite3.Error as exc:
+        raise HTTPException(status_code=500, detail="The session summary could not be loaded.") from exc
+    if len(attempts) != len(ids):
+        raise HTTPException(status_code=404, detail="Some session attempts were not found for this student.")
+    return {"student_id": request.student_id, **summarize_session(attempts, misconceptions)}
 
 
 @app.get("/progress/{student_id}")
@@ -403,14 +563,23 @@ def weak_areas(request: WeakAreaRequest):
 
 @app.post("/adaptive-question")
 async def adaptive_question(student_id: str = Form(...), file: UploadFile = File(...),
-                            topic: str | None = Form(default=None)):
+                            topic: str | None = Form(default=None), focus: bool = Form(default=False),
+                            scope: Literal["adaptive", "weak", "all"] = Form(default="adaptive"),
+                            avoid: str | None = Form(default=None)):
     filename, text = await _read_pdf(file)
+    avoided = _parse_avoid(avoid)
     try:
         history = repository.history(student_id)
+        misconceptions = repository.misconceptions(student_id)
+        statistics = repository.topic_statistics(student_id)
+        graph = repository.get_concept_graph(_material_hash(text))
     except sqlite3.Error as exc:
         raise HTTPException(status_code=500, detail="Progress could not be loaded.") from exc
-    selected_topic, difficulty, reason = choose_next_target(history, topic)
-    quiz = _structured(_quiz_prompt(_quiz_material(text, selected_topic), selected_topic, difficulty), Quiz)
+    selected_topic, difficulty, reason = choose_next_target(
+        history, topic, focus, misconceptions, _unpracticed_concepts(graph, statistics), scope, avoided)
+    related = _prerequisites(graph, selected_topic) if focus and selected_topic else []
+    prompt = _quiz_prompt(_quiz_material(text, selected_topic), selected_topic, difficulty, related, avoided)
+    quiz = await run_in_threadpool(_structured, prompt, Quiz)
     quiz.difficulty = difficulty
     if selected_topic:
         quiz.topic = selected_topic
