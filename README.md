@@ -153,6 +153,7 @@ Reliability details that matter on real hardware:
 
 - Every model response is parsed as JSON and validated with Pydantic. It gets exactly one repair attempt; a second failure saves nothing.
 - Harmless model slips are repaired safely rather than failing a whole feature. Examples: a concept-graph edge pointing at a concept that doesn't exist, or a status written as "needs revision".
+- **Concept Graph density without invented links.** The model is told exactly which way each relationship reads, and to reconsider unconnected concepts before finishing. If more than 25% of concepts are still isolated, one bounded extra pass may propose links. Those links must join existing concepts, involve at least one isolated concept, use a valid relationship type, and must not repeat a pair. New concepts are never accepted, and if the pass fails, the original graph is kept.
 - Every submission carries a request ID. A retried or reloaded submission can never create a duplicate attempt.
 - Concept graphs are cached by document fingerprint. Topics are matched to concepts by whole words, so *Oxygen* never matches *Deoxygenation*.
 - On startup, the app checks that Ollama is running and Qwen3 14B is installed, without running inference. Errors such as "Ollama not running", "model not installed", "timed out" and "unreadable PDF" each have a specific, actionable message.
@@ -227,7 +228,7 @@ npm run build
 npm audit
 ```
 
-**48 backend tests** run without Ollama, because the model boundary is mocked. They cover:
+**57 backend tests** run without Ollama, because the model boundary is mocked. They cover:
 
 - the student model: queue ranking for every signal, in-session adaptation, focus and exam targeting, and session and exam summary maths
 - confidence rules
@@ -235,7 +236,7 @@ npm audit
 - duplicate-submission protection
 - SQLite persistence and schema migration
 - misconception resolution
-- concept-graph caching
+- concept-graph caching, plus sparse-graph enrichment (duplicate, self-link and invalid-type rejection; no invented concepts)
 - whole-word topic matching
 - local model readiness
 - PDF validation and Ollama error handling

@@ -143,9 +143,11 @@ class ConceptGraph(BaseModel):
             relationship = _canonical(str(edge.get("relationship", "related")), RELATIONSHIPS)
             if relationship not in RELATIONSHIPS:
                 relationship = "related"
-            if source not in kept or target not in kept or source == target or (source, target) in pairs:
+            # One link per concept pair: A→B and B→A would draw the same line twice.
+            pair = frozenset((source, target))
+            if source not in kept or target not in kept or source == target or pair in pairs:
                 continue
-            pairs.add((source, target))
+            pairs.add(pair)
             edges.append({"source": source, "target": target, "relationship": relationship})
         return {**data, "concepts": concepts, "edges": edges[:MAX_EDGES]}
 
@@ -161,3 +163,53 @@ class ConceptGraph(BaseModel):
             if edge.source == edge.target:
                 raise ValueError("Concept edges cannot reference the same node twice.")
         return self
+
+
+class EdgeProposals(BaseModel):
+    """Enrichment output: only relationships, never concepts. Each proposal is checked by merge_edge_proposals."""
+    edges: list[dict] = Field(default_factory=list, max_length=64)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_common_shapes(cls, data):
+        # Local models sometimes return a bare list or name the key differently; the edges are still checked.
+        if isinstance(data, list):
+            return {"edges": data}
+        if isinstance(data, dict) and "edges" not in data:
+            for key in ("relationships", "links"):
+                if isinstance(data.get(key), list):
+                    return {"edges": data[key]}
+        return data
+
+
+def isolated_concepts(graph: ConceptGraph) -> list[str]:
+    linked = {edge.source for edge in graph.edges} | {edge.target for edge in graph.edges}
+    return [concept.id for concept in graph.concepts if concept.id not in linked]
+
+
+def merge_edge_proposals(graph: ConceptGraph, proposals: list,
+                         must_touch: set[str] | None = None) -> tuple[ConceptGraph, int]:
+    """Add proposed edges between EXISTING concepts only. Stricter than first-pass repair: unknown IDs,
+    self-links, duplicate pairs (either direction) and unknown relationship types are dropped, not coerced.
+    With must_touch, an edge is kept only if it connects at least one of those (previously isolated) concepts,
+    so enrichment fills gaps instead of densifying parts of the graph that were already connected."""
+    known = {concept.id for concept in graph.concepts}
+    pairs = {frozenset((edge.source, edge.target)) for edge in graph.edges}
+    edges = [edge.model_dump() for edge in graph.edges]
+    added = 0
+    for proposal in proposals:
+        if len(edges) >= MAX_EDGES:
+            break
+        if not isinstance(proposal, dict):
+            continue
+        source, target = _slug(proposal.get("source", "")), _slug(proposal.get("target", ""))
+        relationship = _canonical(str(proposal.get("relationship", "")), RELATIONSHIPS)
+        pair = frozenset((source, target))
+        if relationship not in RELATIONSHIPS or source not in known or target not in known                 or source == target or pair in pairs                 or (must_touch is not None and not pair & must_touch):
+            continue
+        pairs.add(pair)
+        edges.append({"source": source, "target": target, "relationship": relationship})
+        added += 1
+    merged = ConceptGraph.model_validate({"concepts": [concept.model_dump() for concept in graph.concepts],
+                                          "edges": edges})
+    return merged, added

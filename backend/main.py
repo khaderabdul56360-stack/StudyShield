@@ -21,7 +21,8 @@ try:
     from .ollama_client import (MODEL, OllamaModelError, OllamaTimeoutError, OllamaUnavailableError, ask_model,
                                 model_status)
     from .pdf_utils import MAX_PDF_BYTES, chunk_text, extract_text_from_bytes
-    from .schemas import ConceptGraph, Evaluation, Explanation, PDFAnalysis, Quiz
+    from .schemas import (ConceptGraph, EdgeProposals, Evaluation, Explanation, PDFAnalysis, Quiz,
+                          isolated_concepts, merge_edge_proposals)
 except ImportError:
     from adaptive import (choose_next_target, confidence_insight, priority_for_score, revision_queue,
                           status_for_score, summarize_session)
@@ -30,7 +31,8 @@ except ImportError:
     from ollama_client import (MODEL, OllamaModelError, OllamaTimeoutError, OllamaUnavailableError, ask_model,
                                model_status)
     from pdf_utils import MAX_PDF_BYTES, chunk_text, extract_text_from_bytes
-    from schemas import ConceptGraph, Evaluation, Explanation, PDFAnalysis, Quiz
+    from schemas import (ConceptGraph, EdgeProposals, Evaluation, Explanation, PDFAnalysis, Quiz,
+                         isolated_concepts, merge_edge_proposals)
 
 
 repository = ProgressRepository()
@@ -172,17 +174,74 @@ STUDY MATERIAL:
 {material}'''
 
 
+RELATIONSHIP_RULES = """Every edge reads "source RELATIONSHIP target". Get the direction right:
+- prerequisite: the source must be understood BEFORE the target (e.g. "fractions" prerequisite "ratios").
+- part_of: the source is a component or sub-step of the target (e.g. "wheel" part_of "bicycle").
+- supports: the source produces, enables or explains the target (e.g. "practice" supports "fluency").
+- related: a clear link that is none of the above; direction does not matter.
+A place or structure is never part_of a process that happens in it; use related for that."""
+
+
 def _concept_graph_prompt(material: str) -> str:
-    return f'''You are StudyShield, a private local study coach. Build a compact concept graph
-using ONLY concepts explicitly supported by the supplied study material. Include 4 to 12
-meaningful concepts. IDs must be unique lowercase slugs. Importance is from 0 to 1.
-Use prerequisite only when the source concept should be understood first; otherwise use
-related, supports, or part_of. Do not invent outside knowledge. Return ONLY valid JSON:
+    return f'''You are StudyShield, a private local study coach. Build a concept graph using ONLY
+concepts and relationships explicitly supported by the supplied study material. Work in this order:
+1. Identify 4 to 16 meaningful concepts. IDs are unique lowercase slugs. Importance is from 0 to 1.
+2. Identify prerequisite chains.
+3. Identify the other relationships: part_of, supports, or related.
+{RELATIONSHIP_RULES}
+4. Before finalizing, reconsider every concept that has no relationship yet and add one ONLY if the
+   material clearly supports it. A concept may stay unconnected if nothing valid exists.
+When the material supports it, aim for about one relationship per concept (12 to 18 for 16 concepts).
+Never invent a relationship, never link a concept to itself, never repeat a pair, and never link
+concepts just because their names look similar. Do not use outside knowledge. Return ONLY valid JSON:
 {{"concepts":[{{"id":"concept-id","label":"Concept label","importance":0.8}}],
 "edges":[{{"source":"concept-id","target":"other-id","relationship":"prerequisite|related|supports|part_of"}}]}}
 
 STUDY MATERIAL:
 {material}'''
+
+
+GRAPH_ISOLATION_LIMIT = 0.25  # more than a quarter of nodes unconnected triggers one enrichment pass
+
+
+def _graph_enrichment_prompt(graph: ConceptGraph, material: str) -> str:
+    concepts = "\n".join(f"- {concept.id}: {concept.label}" for concept in graph.concepts)
+    edges = "\n".join(f"- {edge.source} -> {edge.target} ({edge.relationship})" for edge in graph.edges) or "- none"
+    isolated = ", ".join(isolated_concepts(graph))
+    return f'''You are reviewing a concept graph built from the study material below.
+Do NOT add, remove or rename concepts. Only propose missing relationships between the concept IDs listed.
+Concepts without any relationship: {isolated}
+For each of them, propose a relationship to another listed concept ONLY if the material clearly supports
+it. If no valid relationship exists, propose nothing for that concept. Never link concepts just because
+their names look similar, never link a concept to itself, and never repeat an existing pair.
+{RELATIONSHIP_RULES}
+Return ONLY valid JSON:
+{{"edges":[{{"source":"concept-id","target":"other-id","relationship":"prerequisite|related|supports|part_of"}}]}}
+
+CONCEPTS (id: label):
+{concepts}
+
+EXISTING RELATIONSHIPS:
+{edges}
+
+STUDY MATERIAL:
+{material}'''
+
+
+def _needs_enrichment(graph: ConceptGraph) -> bool:
+    return len(graph.concepts) > 1 and len(isolated_concepts(graph)) / len(graph.concepts) > GRAPH_ISOLATION_LIMIT
+
+
+def _enrich_graph(graph: ConceptGraph, material: str) -> ConceptGraph:
+    """One bounded repair pass for sparse graphs. Best effort: any failure keeps the validated original."""
+    if not _needs_enrichment(graph):
+        return graph
+    try:
+        proposals = _structured(_graph_enrichment_prompt(graph, material), EdgeProposals)
+    except HTTPException:
+        return graph
+    enriched, _ = merge_edge_proposals(graph, proposals.edges, must_touch=set(isolated_concepts(graph)))
+    return enriched
 
 
 FILLER_WORDS = {"the", "a", "an", "and", "of", "in", "to", "for", "on", "its"}
@@ -359,18 +418,21 @@ async def concept_graph(student_id: str = Form(...), file: UploadFile = File(...
         raise HTTPException(status_code=500, detail="The concept graph could not be loaded.") from exc
 
     cached = cached_graph is not None
+    material = _graph_material(text)
     if cached_graph is None:
-        graph = await run_in_threadpool(_structured, _concept_graph_prompt(_graph_material(text)), ConceptGraph)
-        cached_graph = graph.model_dump()
-        try:
-            repository.save_concept_graph(material_hash, cached_graph)
-        except sqlite3.Error as exc:
-            raise HTTPException(status_code=500, detail="The concept graph could not be saved.") from exc
+        graph = await run_in_threadpool(_structured, _concept_graph_prompt(material), ConceptGraph)
     else:
         try:
             graph = ConceptGraph.model_validate(cached_graph)
         except ValueError as exc:
             raise HTTPException(status_code=500, detail="The cached concept graph is invalid.") from exc
+    # Graphs cached before enrichment existed get the same single check, once.
+    if not cached or not cached_graph.get("enrichment_checked"):
+        graph = await run_in_threadpool(_enrich_graph, graph, material)
+        try:
+            repository.save_concept_graph(material_hash, {**graph.model_dump(), "enrichment_checked": True})
+        except sqlite3.Error as exc:
+            raise HTTPException(status_code=500, detail="The concept graph could not be saved.") from exc
 
     concepts = [
         {**concept.model_dump(), **_concept_performance(concept.label, statistics)}

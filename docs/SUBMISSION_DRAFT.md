@@ -110,7 +110,7 @@ Making a local model dependable took a few layers:
 - **Idempotent answers.** Every submission carries a request ID, so retrying, or even reloading the page while an answer is being graded, can never record it twice.
 - **Resume anywhere.** The last PDF, its analysis and the current session survive a restart, stored only on the device.
 - **Honest readiness.** On launch, the app checks that Ollama is running and Qwen3 14B is installed, without running inference, and shows a specific fix for every failure it can detect.
-- **48 backend tests** cover the student model, validation, persistence and duplicate protection. They run without Ollama by mocking the model boundary.
+- **57 backend tests** cover the student model, validation, persistence and duplicate protection. They run without Ollama by mocking the model boundary.
 
 ## What My Friend Thought
 

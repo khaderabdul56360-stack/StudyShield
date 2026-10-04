@@ -19,12 +19,14 @@ from backend.adaptive import (
 from backend.database import ProgressRepository
 from backend.main import (
     AnswerEvaluationRequest, GeneratedWeakPlan, SessionSummaryRequest, _concept_performance, _graph_material,
-    _model_call, _quiz_material, _read_pdf, _specific_misconceptions, evaluate_answer, health, origins,
-    session_summary,
+    _enrich_graph, _model_call, _needs_enrichment, _quiz_material, _read_pdf, _specific_misconceptions,
+    concept_graph, evaluate_answer, health, origins, session_summary,
 )
 from backend.model_utils import StructuredOutputError, ask_structured, parse_structured
 from backend.ollama_client import OllamaTimeoutError, OllamaUnavailableError, model_status
-from backend.schemas import ConceptGraph, Evaluation, PDFAnalysis, Quiz
+from backend.schemas import (
+    ConceptGraph, EdgeProposals, Evaluation, PDFAnalysis, Quiz, isolated_concepts, merge_edge_proposals,
+)
 
 
 VALID_EVALUATION = (
@@ -570,6 +572,121 @@ class StudentModelTests(unittest.TestCase):
             repo.initialize()
             old = repo.history("friend01")[0]
             self.assertEqual((old["difficulty"], old["request_id"], old["confidence"]), ("Medium", None, "medium"))
+
+
+def _sparse_graph():
+    """8 concepts, 3 links: 3 of 8 concepts (37.5%) are isolated."""
+    names = ["light", "chlorophyll", "photosynthesis", "glucose", "atp", "calvin-cycle", "stroma", "oxygen"]
+    return ConceptGraph.model_validate({
+        "concepts": [{"id": name, "label": name.replace("-", " ").title(), "importance": 0.9 - i / 20}
+                     for i, name in enumerate(names)],
+        "edges": [{"source": "light", "target": "photosynthesis", "relationship": "prerequisite"},
+                  {"source": "chlorophyll", "target": "photosynthesis", "relationship": "supports"},
+                  {"source": "atp", "target": "calvin-cycle", "relationship": "supports"}],
+    })
+
+
+class GraphEnrichmentTests(unittest.TestCase):
+    def test_sparse_graph_is_enriched_with_valid_edges_only(self):
+        graph = _sparse_graph()
+        self.assertEqual(sorted(isolated_concepts(graph)), ["glucose", "oxygen", "stroma"])
+        self.assertTrue(_needs_enrichment(graph))
+        proposals = EdgeProposals(edges=[
+            {"source": "photosynthesis", "target": "glucose", "relationship": "supports"},
+            {"source": "stroma", "target": "calvin-cycle", "relationship": "Part Of"},
+            {"source": "photosynthesis", "target": "oxygen", "relationship": "related"},
+        ])
+        with patch("backend.main._structured", return_value=proposals) as model:
+            enriched = _enrich_graph(graph, "notes")
+        self.assertEqual(model.call_count, 1)
+        self.assertEqual(isolated_concepts(enriched), [])
+        self.assertEqual(len(enriched.edges), 6)
+        self.assertEqual([c.id for c in enriched.concepts], [c.id for c in graph.concepts])
+
+    def test_enrichment_rejects_duplicates_self_links_unknown_ids_and_types(self):
+        graph = _sparse_graph()
+        enriched, added = merge_edge_proposals(graph, [
+            {"source": "photosynthesis", "target": "light", "relationship": "related"},   # reverse duplicate
+            {"source": "light", "target": "photosynthesis", "relationship": "related"},   # duplicate pair
+            {"source": "glucose", "target": "glucose", "relationship": "related"},        # self-link
+            {"source": "glucose", "target": "starch", "relationship": "related"},         # invented concept
+            {"source": "glucose", "target": "oxygen", "relationship": "causes"},          # invalid type
+            {"source": "glucose", "target": "oxygen", "relationship": "related"},         # valid
+            {"source": "oxygen", "target": "glucose", "relationship": "supports"},        # now a duplicate
+            "not an edge",
+        ])
+        self.assertEqual(added, 1)
+        self.assertEqual(len(enriched.edges), 4)
+        self.assertNotIn("starch", {c.id for c in enriched.concepts})
+        self.assertTrue(all(e.relationship in ("prerequisite", "related", "supports", "part_of")
+                            for e in enriched.edges))
+        self.assertTrue(all(e.source != e.target for e in enriched.edges))
+
+    def test_first_pass_rejects_self_and_duplicate_links_in_either_direction(self):
+        graph = ConceptGraph.model_validate({
+            "concepts": [{"id": "a", "label": "A", "importance": .5}, {"id": "b", "label": "B", "importance": .5}],
+            "edges": [{"source": "a", "target": "b", "relationship": "related"},
+                      {"source": "b", "target": "a", "relationship": "related"},
+                      {"source": "a", "target": "a", "relationship": "supports"}],
+        })
+        self.assertEqual([(e.source, e.target) for e in graph.edges], [("a", "b")])
+
+    def test_isolated_nodes_stay_isolated_without_a_valid_relationship(self):
+        graph = _sparse_graph()
+        with patch("backend.main._structured", return_value=EdgeProposals(edges=[
+            {"source": "oxygen", "target": "unknown-concept", "relationship": "related"},
+        ])):
+            enriched = _enrich_graph(graph, "notes")
+        self.assertEqual(sorted(isolated_concepts(enriched)), ["glucose", "oxygen", "stroma"])
+
+    def test_well_connected_graph_skips_enrichment(self):
+        graph = ConceptGraph.model_validate({
+            "concepts": [{"id": n, "label": n, "importance": .5} for n in ("a", "b", "c", "d")],
+            "edges": [{"source": "a", "target": "b", "relationship": "related"},
+                      {"source": "c", "target": "b", "relationship": "supports"}],
+        })  # 1 of 4 isolated = 25%: not above the limit
+        with patch("backend.main._structured") as model:
+            self.assertIs(_enrich_graph(graph, "notes"), graph)
+        model.assert_not_called()
+
+    def test_enrichment_only_adds_links_to_previously_isolated_concepts(self):
+        graph = _sparse_graph()
+        with patch("backend.main._structured", return_value=EdgeProposals(edges=[
+            {"source": "light", "target": "chlorophyll", "relationship": "related"},   # both already linked
+            {"source": "glucose", "target": "stroma", "relationship": "related"},      # two isolated: kept
+            {"source": "oxygen", "target": "photosynthesis", "relationship": "related"},  # one isolated: kept
+        ])):
+            enriched = _enrich_graph(graph, "notes")
+        added = {(e.source, e.target) for e in enriched.edges} - {(e.source, e.target) for e in graph.edges}
+        self.assertEqual(added, {("glucose", "stroma"), ("oxygen", "photosynthesis")})
+
+    def test_enrichment_accepts_common_output_shapes(self):
+        edge = {"source": "glucose", "target": "photosynthesis", "relationship": "related"}
+        for raw in ([edge], {"relationships": [edge]}, {"links": [edge]}, {"edges": [edge]}):
+            with self.subTest(raw=raw):
+                self.assertEqual(EdgeProposals.model_validate(raw).edges, [edge])
+
+    def test_failed_enrichment_keeps_the_validated_graph(self):
+        graph = _sparse_graph()
+        with patch("backend.main._structured", side_effect=HTTPException(status_code=502, detail="invalid")):
+            self.assertIs(_enrich_graph(graph, "notes"), graph)
+
+    def test_concept_graph_route_enriches_once_then_serves_cache(self):
+        graph = _sparse_graph()
+        proposals = EdgeProposals(edges=[{"source": "photosynthesis", "target": "glucose", "relationship": "supports"}])
+
+        async def fake_pdf(_):
+            return "notes.pdf", "Photosynthesis makes glucose in the stroma."
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = ProgressRepository(Path(directory) / "graph.db")
+            repo.initialize()
+            with patch("backend.main.repository", repo), patch("backend.main._read_pdf", fake_pdf),                     patch("backend.main._structured", side_effect=[graph, proposals]) as model:
+                first = asyncio.run(concept_graph(student_id="friend01", file=None))
+                second = asyncio.run(concept_graph(student_id="friend01", file=None))
+        self.assertEqual(model.call_count, 2)  # one generation + one enrichment pass, nothing more
+        self.assertEqual((len(first["edges"]), first["cached"]), (4, False))
+        self.assertEqual((len(second["edges"]), second["cached"]), (4, True))
 
 
 if __name__ == "__main__":
